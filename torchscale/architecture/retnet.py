@@ -17,6 +17,11 @@ from torchscale.component.multiscale_retention import MultiScaleRetention
 from torchscale.component.xmoe.moe_layer import MOELayer
 from torchscale.component.xmoe.routing import Top1Gate, Top2Gate
 from torchscale.component.rms_norm import RMSNorm
+from torchscale.component.multihead_attention import MultiheadAttention
+try:
+    from apex.normalization import FusedLayerNorm as LayerNorm
+except ModuleNotFoundError:
+    from torch.nn import LayerNorm
     
     
 class RetNetRelPos(nn.Module):
@@ -74,6 +79,7 @@ class DecoderLayer(nn.Module):
         args,
         depth,
         is_moe_layer=False,
+        is_encoder_decoder=False,
     ):
         super().__init__()
         self.args = args
@@ -93,6 +99,13 @@ class DecoderLayer(nn.Module):
         self.normalize_before = args.decoder_normalize_before
 
         self.retention_layer_norm = RMSNorm(self.embed_dim, eps=args.layernorm_eps)
+
+        if not is_encoder_decoder:
+            self.encoder_attn = None
+            self.encoder_attn_layer_norm = None
+        else:
+            self.encoder_attn = self.build_encoder_attention(self.embed_dim, args)
+            self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, eps=args.layernorm_eps)
 
         self.is_moe_layer = is_moe_layer
         self.ffn_dim = args.decoder_ffn_embed_dim
@@ -127,7 +140,10 @@ class DecoderLayer(nn.Module):
         self.final_layer_norm = RMSNorm(self.embed_dim, eps=args.layernorm_eps)
 
         if args.deepnorm:
-            self.alpha = math.pow(2.0 * args.decoder_layers, 0.25)
+            if is_encoder_decoder:
+                self.alpha = math.pow(3.0 * args.decoder_layers, 0.25)
+            else:
+                self.alpha = math.pow(2.0 * args.decoder_layers, 0.25)
         else:
             self.alpha = 1.0
 
@@ -148,15 +164,30 @@ class DecoderLayer(nn.Module):
             args.decoder_retention_heads,
         )
 
+    def build_encoder_attention(self, embed_dim, args):
+        return MultiheadAttention(
+            args,
+            embed_dim,
+            args.decoder_attention_heads,
+            dropout=args.attention_dropout,
+            self_attention=False,
+            encoder_decoder_attention=True,
+            subln=args.subln,
+        )
+
     def residual_connection(self, x, residual):
         return residual * self.alpha + x
 
     def forward(
         self,
         x,
+        encoder_out=None,
+        encoder_padding_mask=None,
         incremental_state=None,
         chunkwise_recurrent=False,
         retention_rel_pos=None,
+        cross_attn_rel_pos=None,
+        is_first_step=False,
     ):
         residual = x
         if self.normalize_before:
@@ -177,6 +208,28 @@ class DecoderLayer(nn.Module):
         if not self.normalize_before:
             x = self.retention_layer_norm(x)
 
+        if self.encoder_attn is not None and encoder_out is not None:
+            residual = x
+            if self.normalize_before:
+                x = self.encoder_attn_layer_norm(x)
+
+            x, attn = self.encoder_attn(
+                query=x,
+                key=encoder_out,
+                value=encoder_out,
+                key_padding_mask=encoder_padding_mask,
+                incremental_state=None,
+                rel_pos=cross_attn_rel_pos,
+            )
+            x = self.dropout_module(x)
+
+            if self.drop_path is not None:
+                x = self.drop_path(x)
+
+            x = self.residual_connection(x, residual)
+            if not self.normalize_before:
+                x = self.encoder_attn_layer_norm(x)
+
         residual = x
         if self.normalize_before:
             x = self.final_layer_norm(x)
@@ -195,13 +248,13 @@ class DecoderLayer(nn.Module):
 
         return x, l_aux
 
-
 class RetNetDecoder(nn.Module):
     def __init__(
         self,
         args,
         embed_tokens=None,
         output_projection=None,
+        is_encoder_decoder=False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -239,6 +292,7 @@ class RetNetDecoder(nn.Module):
                     args,
                     depth=i,
                     is_moe_layer=is_moe_layer,
+                    is_encoder_decoder=is_encoder_decoder,
                 )
             )
 
@@ -286,12 +340,13 @@ class RetNetDecoder(nn.Module):
         return output_projection
 
     def build_decoder_layer(
-        self, args, depth, is_moe_layer=False
+        self, args, depth, is_moe_layer=False, is_encoder_decoder=False
     ):
         layer = DecoderLayer(
             args,
             depth,
             is_moe_layer=is_moe_layer,
+            is_encoder_decoder=is_encoder_decoder,
         )
         if args.checkpoint_activations:
             layer = checkpoint_wrapper(layer)
@@ -328,16 +383,20 @@ class RetNetDecoder(nn.Module):
     def forward(
         self,
         prev_output_tokens,
+        encoder_out=None,
         incremental_state=None,
-        features_only=False,
+        features_only=True,
         return_all_hiddens=False,
         token_embeddings=None,
         **kwargs
     ):
-        # embed tokens
-        x, _ = self.forward_embedding(
-            prev_output_tokens, token_embeddings, incremental_state
-        )
+        if self.embed_tokens is not None:
+            # embed tokens
+            x, _ = self.forward_embedding(
+                prev_output_tokens, token_embeddings, incremental_state
+            )
+        else:
+            x = prev_output_tokens
         is_first_step = self.is_first_step(incremental_state)
 
         
@@ -352,7 +411,10 @@ class RetNetDecoder(nn.Module):
         # decoder layers
         inner_states = [x]
 
-        l_aux = []
+        if encoder_out is None:
+            l_aux = []
+        else:
+            l_aux = encoder_out["l_aux"] if "l_aux" in encoder_out else []
 
         for idx, layer in enumerate(self.layers):
             if incremental_state is None or is_first_step:
@@ -365,9 +427,12 @@ class RetNetDecoder(nn.Module):
                     
             x, l_aux_i = layer(
                 x,
+                encoder_out["encoder_out"] if encoder_out is not None else None,
+                encoder_out["encoder_padding_mask"] if encoder_out is not None and "encoder_padding_mask" in encoder_out else None,
                 incremental_state[idx] if incremental_state is not None else None,
                 retention_rel_pos=retention_rel_pos,
                 chunkwise_recurrent=self.chunkwise_recurrent,
+                is_first_step=is_first_step,
             )
             l_aux.append(l_aux_i)
             inner_states.append(x)

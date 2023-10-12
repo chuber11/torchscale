@@ -215,6 +215,10 @@ class RetNetConfig(object):
         self.decoder_value_embed_dim = kwargs.pop("decoder_value_embed_dim", 1280)
         self.decoder_retention_heads = kwargs.pop("decoder_retention_heads", 3)
         self.decoder_ffn_embed_dim = kwargs.pop("decoder_ffn_embed_dim", 1280)
+
+        self.decoder_attention_heads = kwargs.pop("decoder_attention_heads", 12)
+        self.attention_dropout = kwargs.pop("attention_dropout", 0.0)
+
         self.decoder_layers = kwargs.pop("decoder_layers", 12)
         self.decoder_normalize_before = kwargs.pop("decoder_normalize_before", True)
         self.activation_fn = kwargs.pop("activation_fn", "gelu")
