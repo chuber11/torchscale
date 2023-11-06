@@ -356,7 +356,7 @@ class Decoder(nn.Module):
         positions = None
         if self.embed_positions is not None:
             positions = self.embed_positions(
-                tokens, incremental_state=incremental_state
+                tokens[:,:,0], incremental_state=incremental_state
             )
 
         if incremental_state is not None and not self.is_first_step(incremental_state):
@@ -390,7 +390,7 @@ class Decoder(nn.Module):
         self_attn_padding_mask=None,
         encoder_out=None,
         incremental_state=None,
-        features_only=False,
+        features_only=True,
         return_all_hiddens=False,
         token_embeddings=None,
         **kwargs
@@ -448,9 +448,7 @@ class Decoder(nn.Module):
             x, layer_attn, _, l_aux_i = layer(
                 x,
                 encoder_out["encoder_out"] if encoder_out is not None else None,
-                encoder_out["encoder_padding_mask"]
-                if encoder_out is not None
-                else None,
+                encoder_out["encoder_padding_mask"] if encoder_out is not None and         "encoder_padding_mask" in encoder_out else None,
                 incremental_state[idx] if incremental_state is not None else None,
                 self_attn_mask=self_attn_mask,
                 self_attn_padding_mask=self_attn_padding_mask,
